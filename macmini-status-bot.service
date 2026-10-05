@@ -1,0 +1,21 @@
+[Unit]
+Description=Private Telegram thermal status monitor
+ConditionPathExists=%h/.config/macmini-status-bot/config.json
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/lib/macmini-status-bot/bot.py run
+Restart=on-failure
+RestartSec=30
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/macmini-status-bot
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CPUQuota=5%
+MemoryMax=96M
+TasksMax=8
+
+[Install]
+WantedBy=default.target
