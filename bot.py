@@ -118,7 +118,9 @@ class Sampler:
             self.previous_cpu = current or self.previous_cpu
             mem = {l.split(':')[0]: int(l.split()[1]) for l in Path('/proc/meminfo').read_text().splitlines()}
             values['RAM available GiB'] = mem['MemAvailable'] / 1048576
+            values['RAM total GiB'] = mem['MemTotal'] / 1048576
             values['Swap used GiB'] = (mem['SwapTotal'] - mem['SwapFree']) / 1048576
+            values['Swap total GiB'] = mem['SwapTotal'] / 1048576
         except (OSError, ValueError, KeyError, IndexError):
             pass
         props = command(['systemctl', 'show', 'macmini-thermal-guard.service',
@@ -134,7 +136,14 @@ class Sampler:
 
 
 TEMPERATURES = ('CPU', 'GPU', 'PSU', 'Memory', 'TN1F', 'TN1S')
-WARN = {'CPU': 65, 'GPU': 70, 'PSU': 62, 'TN1F': 70, 'TN1S': 70}
+# Early warnings below the thermal guard's sustained shutdown limits (SHUTDOWN).
+WARN = {'CPU': 65, 'GPU': 70, 'PSU': 62, 'Memory': 55, 'TN1F': 70, 'TN1S': 70}
+SHUTDOWN = {'CPU': 70, 'GPU': 75, 'PSU': 65, 'Memory': 60, 'TN1F': 75, 'TN1S': 75}
+FAN_MAX = 5500
+GREEN, YELLOW, RED = '🟢', '🟡', '🔴'
+COOLING = {'temperature curve': (GREEN, 'Normal fan curve'),
+           'maximum cooling latched': (YELLOW, 'Fan held at maximum (SMC fault flag latched)'),
+           'critical shutdown requested': (RED, 'Critical temperature: shutdown requested')}
 
 
 def faults(sample):
@@ -156,48 +165,84 @@ def faults(sample):
     return sorted(result)
 
 
-def report(sample, history=(), title='Status check', alerts=(), cleared=False):
-    """Telegram HTML message; every value is local, but escape text anyway."""
+def num(v):
+    return f'{v:.1f}'.rstrip('0').rstrip('.')
+
+
+def temperature_level(key, v):
+    return RED if v >= WARN[key] else YELLOW if v >= WARN[key] - 2 else GREEN
+
+
+def report(sample, history=(), title='Status check', cleared=False):
+    """Telegram HTML message with a one-line verdict and per-reading levels."""
     try:
-        when = datetime.datetime.fromisoformat(sample['time']).strftime('%a %d %b %Y, %H:%M:%S')
+        when = datetime.datetime.fromisoformat(sample['time']).strftime('%a %d %b, %H:%M')
     except ValueError:
         when = sample['time']
-    temps = []
+    rows, notes = [], []
     for key in TEMPERATURES:
         v = sample.get(key)
         if v is None:
-            temps.append(f'{key:<7}{"n/a":>6}')
-        else:
-            warn = f'  ! warn {WARN[key]}' if key in WARN and v >= WARN[key] - 2 else ''
-            temps.append(f'{key:<7}{v:>6.1f} °C{warn}')
-    def fmt(key, pattern):
-        v = sample.get(key)
-        return pattern.format(v) if v is not None else 'n/a'
-    system = [f'{"Fan":<7}{fmt("Fan RPM", "{:,.0f} RPM")}',
-              f'{"CPU":<7}{fmt("CPU usage %", "{:.0f}% busy")}',
-              f'{"RAM":<7}{fmt("RAM available GiB", "{:.2f} GiB free")}',
-              f'{"Swap":<7}{fmt("Swap used GiB", "{:.2f} GiB used")}']
-    controller = sample['controller']
-    lines = [f'<b>{html.escape(title)}</b>', f'<i>{html.escape(when)}</i>', '',
-             '<b>Temperatures</b>', '<pre>' + html.escape('\n'.join(temps)) + '</pre>',
-             '<b>System</b>', '<pre>' + html.escape('\n'.join(system)) + '</pre>',
-             '<b>Thermal controller</b>',
-             ('✅ ' if controller == 'active' else '❌ ') + html.escape(controller.capitalize()),
-             'Cooling: ' + html.escape(sample['protection']),
-             'Wall power: not measured (no supported meter)']
+            rows.append((RED, f'{key}: no reading'))
+            notes.append(f'{key} reading missing')
+            continue
+        level = temperature_level(key, v)
+        rows.append((level, f'{key} {num(v)}°C — {num(SHUTDOWN[key] - v)}° below shutdown'))
+        if level != GREEN:
+            notes.append(f'{key} {"over" if level == RED else "near"} warning level ({WARN[key]}°C)')
+    load = []
+    ram, total = sample.get('RAM available GiB'), sample.get('RAM total GiB')
+    if ram is not None and total:
+        level = RED if ram < 0.5 else YELLOW if ram < 1.5 else GREEN
+        load.append((level, f'RAM {100 * (1 - ram / total):.0f}% used ({ram:.1f} of {total:.1f} GiB free)'))
+        if level != GREEN:
+            notes.append('RAM running low')
+    else:
+        load.append((YELLOW, 'RAM: no reading'))
+    swap, swap_total = sample.get('Swap used GiB'), sample.get('Swap total GiB')
+    if swap is not None and swap_total:
+        load.append(('⚪', f'Swap {100 * swap / swap_total:.0f}% used ({swap:.1f} of {swap_total:.1f} GiB)'))
+    busy = sample.get('CPU usage %')
+    load.append(('⚪', f'CPU {busy:.0f}% busy' if busy is not None else 'CPU load: no reading'))
+    rpm = sample.get('Fan RPM')
+    if rpm is None:
+        load.append((RED, 'Fan: no reading'))
+        notes.append('fan reading missing')
+    else:
+        load.append(('⚪', f'Fan {rpm:,.0f} RPM ({min(100, 100 * rpm / FAN_MAX):.0f}% of max)'))
+    guard = []
+    if sample['controller'] == 'active':
+        guard.append((GREEN, 'Thermal guard running'))
+    else:
+        guard.append((RED, 'Thermal guard ' + sample['controller']))
+        notes.append('thermal guard not running')
+    level, text = COOLING.get(sample['protection'], (YELLOW, 'Cooling mode ' + sample['protection']))
+    guard.append((level, text))
+    if level != GREEN:
+        notes.append({'maximum cooling latched': 'fan held at max (known SMC flag)'}.get(
+            sample['protection'], text.lower()))
+    levels = [lv for lv, _ in rows + load + guard]
+    overall = RED if RED in levels else YELLOW if YELLOW in levels else GREEN
+    verdict = {GREEN: 'All good', YELLOW: 'Watch', RED: 'Needs attention'}[overall]
+    def section(heading, items):
+        return [f'<b>{heading}</b>'] + [f'{lv} {html.escape(t)}' for lv, t in items]
+    lines = [f'{overall} <b>Mac mini: {verdict}</b>']
+    if notes:
+        summary = '; '.join(notes)
+        lines.append(html.escape(summary[0].upper() + summary[1:]))
+    lines += [f'<i>{html.escape(title)} · {html.escape(when)}</i>', '']
+    lines += section('🌡 Temperatures', rows) + [''] + section('💻 System', load)
+    lines += [''] + section('🛡 Protection', guard)
     if history:
-        rows = [f'{"":<7}{"avg":>8}{"peak":>8}']
-        for key, label in (('CPU', 'CPU °C'), ('GPU', 'GPU °C'), ('PSU', 'PSU °C'),
-                           ('Fan RPM', 'Fan'), ('CPU usage %', 'Busy %')):
+        lines += ['', f'<b>📈 Recent trend</b> ({len(history)} samples, avg / peak)']
+        for key, unit in (('CPU', '°C'), ('GPU', '°C'), ('PSU', '°C'), ('CPU usage %', '% busy')):
             nums = [s[key] for s in history if isinstance(s.get(key), (float, int))]
             if nums:
-                rows.append(f'{label:<7}{sum(nums) / len(nums):>8.1f}{max(nums):>8.1f}')
-        lines += ['', f'<b>Recent samples</b> ({len(history)}, about every 30 s; not continuous)',
-                  '<pre>' + html.escape('\n'.join(rows)) + '</pre>']
-    if alerts:
-        lines += ['', '<b>⚠️ Alerts</b>'] + ['• ' + html.escape(a) for a in alerts]
-    elif cleared:
-        lines += ['', '✅ Previously reported alert conditions cleared.']
+                label = 'CPU load' if key == 'CPU usage %' else key
+                lines.append(f'{html.escape(label)}: {num(sum(nums) / len(nums))} / {num(max(nums))}{unit}')
+    if cleared and overall == GREEN:
+        lines += ['', '✅ Previously reported alerts have cleared.']
+    lines += ['', '<i>Wall power not measured.</i>']
     return '\n'.join(lines)
 
 
@@ -241,7 +286,7 @@ def run():
                 if due or alert_due:
                     text = report(sample, history if due else (),
                                   'Hourly summary' if due else 'Alert update',
-                                  current_faults, bool(state.get('faults')))
+                                  bool(state.get('faults')) and not current_faults)
                     api(cfg['token'], 'sendMessage', chat_id=cfg['chat_id'], text=text,
                         parse_mode='HTML', reply_markup=BUTTON)
                     state.update(faults=current_faults, alert_sent=time.time())
@@ -255,9 +300,8 @@ def run():
                     q = update['callback_query']
                     api(cfg['token'], 'answerCallbackQuery', callback_query_id=q['id'])
                     if time.monotonic() - last_button >= 10:
-                        now_sample = sampler.sample()
                         api(cfg['token'], 'sendMessage', chat_id=cfg['chat_id'],
-                            text=report(now_sample, alerts=faults(now_sample)),
+                            text=report(sampler.sample()),
                             parse_mode='HTML', reply_markup=BUTTON)
                         last_button = time.monotonic()
                 offset = max(offset, update['update_id'] + 1)
@@ -286,7 +330,7 @@ if __name__ == '__main__':
     if action == 'status':
         sample = Sampler().sample()
         # Terminal output: drop Telegram HTML markup.
-        print(html.unescape(re.sub(r'<[^>]+>', '', report(sample, alerts=faults(sample)))))
+        print(html.unescape(re.sub(r'<[^>]+>', '', report(sample))))
     elif action == 'setup':
         setup()
     else:

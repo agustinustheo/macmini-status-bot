@@ -30,20 +30,37 @@ class Tests(unittest.TestCase):
 
     def test_never_invent_power_or_missing_temperatures(self):
         text = bot.report({'time':'now', 'controller':'unknown', 'protection':'unknown'})
-        self.assertRegex(text, r'CPU +n/a')
-        self.assertIn('Wall power: not measured', text)
+        self.assertIn('🔴 CPU: no reading', text)
+        self.assertIn('Needs attention', text)
+        self.assertIn('Wall power not measured', text)
 
-    def test_report_is_escaped_html_with_alerts_and_warnings(self):
-        sample = {'time':'2026-10-05T17:14:23+07:00', 'controller':'active',
-                  'protection':'maximum cooling latched', 'PSU':60.2, 'CPU':49.0, 'Fan RPM':5511.0}
-        text = bot.report(sample, [sample], 'Hourly summary', ['A <b> & C'])
-        self.assertIn('<b>Hourly summary</b>', text)
-        self.assertIn('Mon 05 Oct 2026, 17:14:23', text)
-        self.assertIn('PSU      60.2 °C  ! warn 62', text)
-        self.assertNotIn('CPU      49.0 °C  !', text)
-        self.assertIn('5,511 RPM', text)
-        self.assertIn('• A &lt;b&gt; &amp; C', text)
-        self.assertIn('cleared', bot.report(sample, cleared=True))
+    def test_report_verdict_levels_and_escaping(self):
+        good = {'time':'2026-10-05T17:14:23+07:00', 'controller':'active',
+                'protection':'temperature curve', 'CPU':49.0, 'GPU':55, 'PSU':55,
+                'Memory':44, 'TN1F':50, 'TN1S':50, 'Fan RPM':2750.0,
+                'RAM available GiB':4.5, 'RAM total GiB':7.5,
+                'Swap used GiB':0.5, 'Swap total GiB':2.0, 'CPU usage %':12.0}
+        text = bot.report(good, [good], 'Hourly summary')
+        self.assertTrue(text.startswith('🟢 <b>Mac mini: All good</b>'))
+        self.assertIn('Hourly summary · Mon 05 Oct, 17:14', text)
+        self.assertIn('🟢 CPU 49°C — 21° below shutdown', text)
+        self.assertIn('RAM 40% used (4.5 of 7.5 GiB free)', text)
+        self.assertIn('Swap 25% used', text)
+        self.assertIn('Fan 2,750 RPM (50% of max)', text)
+        self.assertIn('Recent trend', text)
+        self.assertIn('cleared', bot.report(good, cleared=True))
+        watch = dict(good, PSU=60.5, protection='maximum cooling latched')
+        text = bot.report(watch)
+        self.assertTrue(text.startswith('🟡 <b>Mac mini: Watch</b>'))
+        self.assertIn('PSU near warning level (62°C); fan held at max (known SMC flag)', text)
+        self.assertIn('🟡 PSU 60.5°C — 4.5° below shutdown', text)
+        self.assertNotIn('cleared', bot.report(watch, cleared=True))
+        hot = dict(good, GPU=71, controller='inactive', protection='<x>')
+        text = bot.report(hot)
+        self.assertTrue(text.startswith('🔴 <b>Mac mini: Needs attention</b>'))
+        self.assertIn('GPU over warning level', text)
+        self.assertIn('Cooling mode &lt;x&gt;', text)
+        self.assertIn('Memory approaching configured shutdown limit', bot.faults(dict(good, Memory=55)))
 
     def test_private_atomic_storage(self):
         with tempfile.TemporaryDirectory() as tmp:

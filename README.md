@@ -137,11 +137,16 @@ file, systemd skips startup. After configuring an already enabled installation, 
 | Recovery | Reported when all previously reported alert conditions have cleared |
 | Delivery failure | Generic local log message, then a 30-second retry delay |
 
-Messages use Telegram HTML formatting: a title (status check, hourly summary or
-alert update), aligned temperature and system blocks, controller state, and an
-alerts section. Button responses also list currently active alert conditions. A
-temperature within 2°C of its warning level is marked `! warn <level>`. The local
-`bot.py status` command prints the same report without markup.
+Each message starts with an overall verdict and the reasons for it:
+🟢 **All good**, 🟡 **Watch**, or 🔴 **Needs attention**. Every temperature shows its
+distance from the thermal guard's sustained shutdown limit and is marked 🟢 below,
+🟡 within 2°C of, or 🔴 at or above its warning level. RAM is 🟡 below 1.5 GiB
+available and 🔴 below 0.5 GiB. Swap, CPU load and fan speed (as a share of
+5,500 RPM) are informational (⚪). A missing reading, stopped guard, or any cooling
+mode other than the normal fan curve also lowers the verdict, so a latched SMC
+fault keeps reports at 🟡 even when temperatures are fine. Hourly summaries add a
+recent average/peak trend. The local `bot.py status` command prints the same
+report without markup.
 
 Hourly averages and peaks cover the retained samples, which can span more than an
 hour. They are **sampled peaks**, not a guarantee that brief spikes were captured.
@@ -157,6 +162,7 @@ Warnings currently trigger at:
 | CPU | At least 65°C |
 | GPU | At least 70°C |
 | PSU | At least 62°C |
+| Memory sensor | At least 55°C |
 | `TN1F` or `TN1S` | At least 70°C |
 | Available RAM | Less than 0.5 GiB |
 | Required temperature or fan reading | Missing or unreadable |
