@@ -30,8 +30,20 @@ class Tests(unittest.TestCase):
 
     def test_never_invent_power_or_missing_temperatures(self):
         text = bot.report({'time':'now', 'controller':'unknown', 'protection':'unknown'})
-        self.assertIn('CPU: unavailable', text)
-        self.assertIn('Wall power / energy: unavailable', text)
+        self.assertRegex(text, r'CPU +n/a')
+        self.assertIn('Wall power: not measured', text)
+
+    def test_report_is_escaped_html_with_alerts_and_warnings(self):
+        sample = {'time':'2026-10-05T17:14:23+07:00', 'controller':'active',
+                  'protection':'maximum cooling latched', 'PSU':60.2, 'CPU':49.0, 'Fan RPM':5511.0}
+        text = bot.report(sample, [sample], 'Hourly summary', ['A <b> & C'])
+        self.assertIn('<b>Hourly summary</b>', text)
+        self.assertIn('Mon 05 Oct 2026, 17:14:23', text)
+        self.assertIn('PSU      60.2 °C  ! warn 62', text)
+        self.assertNotIn('CPU      49.0 °C  !', text)
+        self.assertIn('5,511 RPM', text)
+        self.assertIn('• A &lt;b&gt; &amp; C', text)
+        self.assertIn('cleared', bot.report(sample, cleared=True))
 
     def test_private_atomic_storage(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -78,6 +90,7 @@ class LoopTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):bot.run()
             self.assertEqual(bot.json.loads(state.read_text())['offset'],3)
         self.assertEqual(sum(m=='sendMessage' for m,k in calls),2)
+        self.assertTrue(all(k['parse_mode']=='HTML' for m,k in calls if m=='sendMessage'))
         self.assertEqual(sum(m=='answerCallbackQuery' for m,k in calls),1)
         self.assertEqual([k['offset'] for m,k in calls if m=='getUpdates'],[0,3])
 

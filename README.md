@@ -137,10 +137,17 @@ file, systemd skips startup. After configuring an already enabled installation, 
 | Recovery | Reported when all previously reported alert conditions have cleared |
 | Delivery failure | Generic local log message, then a 30-second retry delay |
 
+Messages use Telegram HTML formatting: a title (status check, hourly summary or
+alert update), aligned temperature and system blocks, controller state, and an
+alerts section. Button responses also list currently active alert conditions. A
+temperature within 2°C of its warning level is marked `! warn <level>`. The local
+`bot.py status` command prints the same report without markup.
+
 Hourly averages and peaks cover the retained samples, which can span more than an
 hour. They are **sampled peaks**, not a guarantee that brief spikes were captured.
 CPU usage includes all host processes and is measured since the preceding sample;
-a button check also advances that measurement interval. Occupied swap alone does
+a button check also advances that measurement interval. Without a usable earlier
+reading, such as the first sample after startup, it is measured over half a second. Occupied swap alone does
 not indicate current memory pressure.
 
 Warnings currently trigger at:

@@ -3,10 +3,12 @@
 import argparse
 import datetime
 import getpass
+import html
 import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 import urllib.request
@@ -66,6 +68,14 @@ class Sampler:
     def __init__(self):
         self.previous_cpu = None
 
+    @staticmethod
+    def cpu_times():
+        try:
+            cpu = [int(x) for x in Path('/proc/stat').read_text().splitlines()[0].split()[1:9]]
+            return sum(cpu), cpu[3] + cpu[4]
+        except (OSError, ValueError, IndexError):
+            return None
+
     def sample(self):
         values = {}
         cores = []
@@ -96,13 +106,16 @@ class Sampler:
             values['CPU'] = max(cores)
         # A missing sensor remains unavailable rather than becoming zero.
         try:
-            cpu = [int(x) for x in Path('/proc/stat').read_text().splitlines()[0].split()[1:9]]
-            total, idle = sum(cpu), cpu[3] + cpu[4]
-            if self.previous_cpu:
-                old_total, old_idle = self.previous_cpu
-                if total > old_total:
-                    values['CPU usage %'] = round(100 * (1 - (idle - old_idle) / (total - old_total)), 1)
-            self.previous_cpu = total, idle
+            current = self.cpu_times()
+            if current and (not self.previous_cpu or current[0] - self.previous_cpu[0] < 50):
+                # No usable earlier reading (e.g. first sample): measure briefly instead.
+                self.previous_cpu = current
+                time.sleep(0.5)
+                current = self.cpu_times()
+            if self.previous_cpu and current and current[0] > self.previous_cpu[0]:
+                (old_total, old_idle), (total, idle) = self.previous_cpu, current
+                values['CPU usage %'] = round(100 * (1 - (idle - old_idle) / (total - old_total)), 1)
+            self.previous_cpu = current or self.previous_cpu
             mem = {l.split(':')[0]: int(l.split()[1]) for l in Path('/proc/meminfo').read_text().splitlines()}
             values['RAM available GiB'] = mem['MemAvailable'] / 1048576
             values['Swap used GiB'] = (mem['SwapTotal'] - mem['SwapFree']) / 1048576
@@ -120,9 +133,13 @@ class Sampler:
         return values
 
 
+TEMPERATURES = ('CPU', 'GPU', 'PSU', 'Memory', 'TN1F', 'TN1S')
+WARN = {'CPU': 65, 'GPU': 70, 'PSU': 62, 'TN1F': 70, 'TN1S': 70}
+
+
 def faults(sample):
     result = set()
-    for key, limit in {'CPU': 65, 'GPU': 70, 'PSU': 62, 'TN1F': 70, 'TN1S': 70}.items():
+    for key, limit in WARN.items():
         value = sample.get(key)
         if value is None:
             result.add(key + ' reading unavailable')
@@ -139,22 +156,48 @@ def faults(sample):
     return sorted(result)
 
 
-def report(sample, history=()):
-    lines = ['Mac thermal status', sample['time']]
-    for key in ('CPU', 'GPU', 'PSU', 'Memory', 'TN1F', 'TN1S'):
+def report(sample, history=(), title='Status check', alerts=(), cleared=False):
+    """Telegram HTML message; every value is local, but escape text anyway."""
+    try:
+        when = datetime.datetime.fromisoformat(sample['time']).strftime('%a %d %b %Y, %H:%M:%S')
+    except ValueError:
+        when = sample['time']
+    temps = []
+    for key in TEMPERATURES:
         v = sample.get(key)
-        lines.append(f'{key}: {v:.1f} C' if v is not None else f'{key}: unavailable')
-    for key in ('Fan RPM', 'CPU usage %', 'RAM available GiB', 'Swap used GiB'):
+        if v is None:
+            temps.append(f'{key:<7}{"n/a":>6}')
+        else:
+            warn = f'  ! warn {WARN[key]}' if key in WARN and v >= WARN[key] - 2 else ''
+            temps.append(f'{key:<7}{v:>6.1f} °C{warn}')
+    def fmt(key, pattern):
         v = sample.get(key)
-        lines.append(f'{key}: {v:.2f}' if v is not None else f'{key}: unavailable')
-    lines += ['Controller: ' + sample['controller'], 'Cooling: ' + sample['protection'],
-              'Wall power / energy: unavailable (no supported meter)']
+        return pattern.format(v) if v is not None else 'n/a'
+    system = [f'{"Fan":<7}{fmt("Fan RPM", "{:,.0f} RPM")}',
+              f'{"CPU":<7}{fmt("CPU usage %", "{:.0f}% busy")}',
+              f'{"RAM":<7}{fmt("RAM available GiB", "{:.2f} GiB free")}',
+              f'{"Swap":<7}{fmt("Swap used GiB", "{:.2f} GiB used")}']
+    controller = sample['controller']
+    lines = [f'<b>{html.escape(title)}</b>', f'<i>{html.escape(when)}</i>', '',
+             '<b>Temperatures</b>', '<pre>' + html.escape('\n'.join(temps)) + '</pre>',
+             '<b>System</b>', '<pre>' + html.escape('\n'.join(system)) + '</pre>',
+             '<b>Thermal controller</b>',
+             ('✅ ' if controller == 'active' else '❌ ') + html.escape(controller.capitalize()),
+             'Cooling: ' + html.escape(sample['protection']),
+             'Wall power: not measured (no supported meter)']
     if history:
-        lines.append(f'Recent sampled history ({len(history)} samples; not continuous peaks):')
-        for key in ('CPU', 'GPU', 'PSU', 'Fan RPM', 'CPU usage %'):
+        rows = [f'{"":<7}{"avg":>8}{"peak":>8}']
+        for key, label in (('CPU', 'CPU °C'), ('GPU', 'GPU °C'), ('PSU', 'PSU °C'),
+                           ('Fan RPM', 'Fan'), ('CPU usage %', 'Busy %')):
             nums = [s[key] for s in history if isinstance(s.get(key), (float, int))]
             if nums:
-                lines.append(f'{key}: average {sum(nums)/len(nums):.1f}, peak {max(nums):.1f}')
+                rows.append(f'{label:<7}{sum(nums) / len(nums):>8.1f}{max(nums):>8.1f}')
+        lines += ['', f'<b>Recent samples</b> ({len(history)}, about every 30 s; not continuous)',
+                  '<pre>' + html.escape('\n'.join(rows)) + '</pre>']
+    if alerts:
+        lines += ['', '<b>⚠️ Alerts</b>'] + ['• ' + html.escape(a) for a in alerts]
+    elif cleared:
+        lines += ['', '✅ Previously reported alert conditions cleared.']
     return '\n'.join(lines)
 
 
@@ -196,12 +239,11 @@ def run():
                 due = time.time() - state.get('sent', 0) >= 3600
                 alert_due = changed and time.time() - state.get('alert_sent', 0) >= 300
                 if due or alert_due:
-                    text = report(sample, history if due else ())
-                    if current_faults:
-                        text += '\nAlerts:\n' + '\n'.join(current_faults)
-                    elif state.get('faults'):
-                        text += '\nPreviously reported alert conditions cleared.'
-                    api(cfg['token'], 'sendMessage', chat_id=cfg['chat_id'], text=text, reply_markup=BUTTON)
+                    text = report(sample, history if due else (),
+                                  'Hourly summary' if due else 'Alert update',
+                                  current_faults, bool(state.get('faults')))
+                    api(cfg['token'], 'sendMessage', chat_id=cfg['chat_id'], text=text,
+                        parse_mode='HTML', reply_markup=BUTTON)
                     state.update(faults=current_faults, alert_sent=time.time())
                     if due:
                         state['sent'] = time.time()
@@ -213,8 +255,10 @@ def run():
                     q = update['callback_query']
                     api(cfg['token'], 'answerCallbackQuery', callback_query_id=q['id'])
                     if time.monotonic() - last_button >= 10:
+                        now_sample = sampler.sample()
                         api(cfg['token'], 'sendMessage', chat_id=cfg['chat_id'],
-                            text=report(sampler.sample()), reply_markup=BUTTON)
+                            text=report(now_sample, alerts=faults(now_sample)),
+                            parse_mode='HTML', reply_markup=BUTTON)
                         last_button = time.monotonic()
                 offset = max(offset, update['update_id'] + 1)
                 state['offset'] = offset
@@ -240,10 +284,9 @@ if __name__ == '__main__':
     parser.add_argument('action', choices=['run', 'status', 'setup'])
     action = parser.parse_args().action
     if action == 'status':
-        sampler = Sampler()
-        sampler.sample()
-        time.sleep(1)
-        print(report(sampler.sample()))
+        sample = Sampler().sample()
+        # Terminal output: drop Telegram HTML markup.
+        print(html.unescape(re.sub(r'<[^>]+>', '', report(sample, alerts=faults(sample)))))
     elif action == 'setup':
         setup()
     else:
