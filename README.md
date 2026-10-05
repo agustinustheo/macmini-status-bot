@@ -1,4 +1,4 @@
-# Mac mini Status Bot
+# MacMini Status Bot
 
 Check a Linux Mac mini from Telegram with one **Status Check** button. Receive
 hourly health summaries and alerts when monitored conditions change.
