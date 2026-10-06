@@ -39,13 +39,18 @@ class Tests(unittest.TestCase):
                 'protection':'temperature curve', 'CPU':49.0, 'GPU':55, 'PSU':55,
                 'Memory':44, 'TN1F':50, 'TN1S':50, 'Fan RPM':2750.0,
                 'RAM available GiB':4.5, 'RAM total GiB':7.5,
-                'Swap used GiB':0.5, 'Swap total GiB':2.0, 'CPU usage %':12.0}
+                'Swap used GiB':0.5, 'Swap total GiB':2.0, 'CPU usage %':12.0,
+                'Disk used %':64.2, 'Disk free GiB':76.4, 'Disk total GiB':219.0}
         text = bot.report(good, [good], 'Hourly summary')
         self.assertTrue(text.startswith('🟢 <b>Mac mini: All good</b>'))
         self.assertIn('Hourly summary · Mon 05 Oct, 17:14', text)
         self.assertIn('🟢 CPU 49°C — 21° below shutdown', text)
         self.assertIn('RAM 40% used (4.5 of 7.5 GiB free)', text)
         self.assertIn('Swap 25% used', text)
+        self.assertIn('🟢 Disk 64% used (76 of 219 GiB free)', text)
+        self.assertIn('Disk getting full', bot.report(dict(good, **{'Disk used %':88})))
+        self.assertIn('🔴 Disk 96% used', bot.report(dict(good, **{'Disk used %':96})))
+        self.assertIn('Disk at least 95% full', bot.faults(dict(good, **{'Disk used %':96})))
         self.assertIn('Fan 2,750 RPM (50% of max)', text)
         self.assertIn('Recent trend', text)
         self.assertIn('cleared', bot.report(good, cleared=True))

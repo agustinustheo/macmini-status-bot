@@ -123,6 +123,15 @@ class Sampler:
             values['Swap total GiB'] = mem['SwapTotal'] / 1048576
         except (OSError, ValueError, KeyError, IndexError):
             pass
+        try:
+            fs = os.statvfs('/')
+            free, used = fs.f_bavail * fs.f_frsize, (fs.f_blocks - fs.f_bfree) * fs.f_frsize
+            values['Disk free GiB'] = free / 1073741824
+            values['Disk total GiB'] = fs.f_blocks * fs.f_frsize / 1073741824
+            # Same basis as df: space reserved for root is not available to users.
+            values['Disk used %'] = 100 * used / (used + free) if used + free else None
+        except OSError:
+            pass
         props = command(['systemctl', 'show', 'macmini-thermal-guard.service',
                          '-p', 'ActiveState', '-p', 'StatusText'])
         fields = dict(l.split('=', 1) for l in props.splitlines() if '=' in l)
@@ -162,6 +171,8 @@ def faults(sample):
         result.add('Controller: ' + sample.get('protection', 'unknown'))
     if sample.get('RAM available GiB', 10) < 0.5:
         result.add('Available RAM below 0.5 GiB')
+    if sample.get('Disk used %', 0) >= 95:
+        result.add('Disk at least 95% full')
     return sorted(result)
 
 
@@ -199,6 +210,15 @@ def report(sample, history=(), title='Status check', cleared=False):
             notes.append('RAM running low')
     else:
         load.append((YELLOW, 'RAM: no reading'))
+    disk = sample.get('Disk used %')
+    if disk is not None:
+        level = RED if disk >= 95 else YELLOW if disk >= 85 else GREEN
+        load.append((level, f'Disk {disk:.0f}% used ({sample["Disk free GiB"]:.0f} of '
+                            f'{sample["Disk total GiB"]:.0f} GiB free)'))
+        if level != GREEN:
+            notes.append('disk almost full' if level == RED else 'disk getting full')
+    else:
+        load.append((YELLOW, 'Disk: no reading'))
     swap, swap_total = sample.get('Swap used GiB'), sample.get('Swap total GiB')
     if swap is not None and swap_total:
         load.append(('⚪', f'Swap {100 * swap / swap_total:.0f}% used ({swap:.1f} of {swap_total:.1f} GiB)'))

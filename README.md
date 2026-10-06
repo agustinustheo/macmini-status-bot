@@ -141,7 +141,8 @@ Each message starts with an overall verdict and the reasons for it:
 🟢 **All good**, 🟡 **Watch**, or 🔴 **Needs attention**. Every temperature shows its
 distance from the thermal guard's sustained shutdown limit and is marked 🟢 below,
 🟡 within 2°C of, or 🔴 at or above its warning level. RAM is 🟡 below 1.5 GiB
-available and 🔴 below 0.5 GiB. Swap, CPU load and fan speed (as a share of
+available and 🔴 below 0.5 GiB. Disk usage of the root filesystem (same basis as `df`) is 🟡 from
+85% used and 🔴 from 95%. Swap, CPU load and fan speed (as a share of
 5,500 RPM) are informational (⚪). A missing reading, stopped guard, or any cooling
 mode other than the normal fan curve also lowers the verdict, so a latched SMC
 fault keeps reports at 🟡 even when temperatures are fine. Hourly summaries add a
@@ -165,6 +166,7 @@ Warnings currently trigger at:
 | Memory sensor | At least 55°C |
 | `TN1F` or `TN1S` | At least 70°C |
 | Available RAM | Less than 0.5 GiB |
+| Root filesystem | At least 95% used |
 | Required temperature or fan reading | Missing or unreadable |
 | Thermal controller | Inactive, unreadable, or outside the recognized normal temperature-curve mode |
 
