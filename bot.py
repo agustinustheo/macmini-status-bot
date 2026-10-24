@@ -223,6 +223,8 @@ class Sampler:
         values['protection'] = ('maximum cooling latched' if 'Fault cooling latched' in status
                                 else 'critical shutdown requested' if 'Critical temperature' in status
                                 else 'temperature curve' if status.startswith('manual;') else 'unknown')
+        limit = re.search(r'CPU speed limit (\d+) MHz', status)
+        values['CPU speed limit MHz'] = int(limit.group(1)) if limit else None
         values['t3'] = t3_sample()
         values['time'] = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
         return values
@@ -230,8 +232,10 @@ class Sampler:
 
 TEMPERATURES = ('CPU', 'GPU', 'PSU', 'Memory', 'TN1F', 'TN1S')
 # Early warnings below the thermal guard's sustained shutdown limits (SHUTDOWN).
-WARN = {'CPU': 65, 'GPU': 70, 'PSU': 62, 'Memory': 55, 'TN1F': 70, 'TN1S': 70}
-SHUTDOWN = {'CPU': 70, 'GPU': 75, 'PSU': 65, 'Memory': 60, 'TN1F': 75, 'TN1S': 75}
+# The guard limits CPU speed from 80 C and shuts down at 85 C. Without cpufreq
+# control it keeps 70 C; this bot cannot see which applies.
+WARN = {'CPU': 75, 'GPU': 70, 'PSU': 62, 'Memory': 55, 'TN1F': 70, 'TN1S': 70}
+SHUTDOWN = {'CPU': 85, 'GPU': 75, 'PSU': 65, 'Memory': 60, 'TN1F': 75, 'TN1S': 75}
 FAN_MAX = 5500
 GREEN, YELLOW, RED = '🟢', '🟡', '🔴'
 COOLING = {'temperature curve': (GREEN, 'Normal fan curve'),
@@ -257,6 +261,8 @@ def faults(sample):
         result.add('Available RAM below 0.5 GiB')
     if sample.get('Disk used %', 0) >= 95:
         result.add('Disk at least 95% full')
+    if sample.get('CPU speed limit MHz'):
+        result.add('CPU speed limited by thermal guard')
     if 't3' in sample:
         result.update(t3_faults(sample['t3']))
     return sorted(result)
@@ -419,6 +425,9 @@ def report(sample, history=(), title='Status check', cleared=False):
     if level != GREEN:
         notes.append({'maximum cooling latched': 'fan held at max (known SMC flag)'}.get(
             sample['protection'], text.lower()))
+    if sample.get('CPU speed limit MHz'):
+        guard.append((YELLOW, f"CPU speed limited to {sample['CPU speed limit MHz']} MHz (hot CPU)"))
+        notes.append('CPU slowed to cool down')
     services = []
     if 't3' in sample:
         services, service_notes = t3_rows(sample['t3'])

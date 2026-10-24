@@ -175,7 +175,8 @@ Warnings currently trigger at:
 
 | Condition | Warning |
 | --- | --- |
-| CPU | At least 65°C |
+| CPU | At least 75°C |
+| CPU speed | The thermal guard limits the CPU speed (from 80°C) |
 | GPU | At least 70°C |
 | PSU | At least 62°C |
 | Memory sensor | At least 55°C |

@@ -44,7 +44,7 @@ class Tests(unittest.TestCase):
         text = bot.report(good, [good], 'Hourly summary')
         self.assertTrue(text.startswith('🟢 <b>Mac mini: All good</b>'))
         self.assertIn('Hourly summary · Mon 05 Oct, 17:14', text)
-        self.assertIn('🟢 CPU 49°C — 21° below shutdown', text)
+        self.assertIn('🟢 CPU 49°C — 36° below shutdown', text)
         self.assertIn('RAM 40% used (4.5 of 7.5 GiB free)', text)
         self.assertIn('Swap 25% used', text)
         self.assertIn('🟢 Disk 64% used (76 of 219 GiB free)', text)
@@ -66,6 +66,17 @@ class Tests(unittest.TestCase):
         self.assertIn('GPU over warning level', text)
         self.assertIn('Cooling mode &lt;x&gt;', text)
         self.assertIn('Memory approaching configured shutdown limit', bot.faults(dict(good, Memory=55)))
+
+    def test_cpu_speed_limit_from_guard_status(self):
+        sample = {'time': 'now', 'controller': 'active', 'protection': 'maximum cooling latched',
+                  'CPU speed limit MHz': 1596}
+        self.assertIn('CPU speed limited by thermal guard', bot.faults(sample))
+        text = bot.report(sample)
+        self.assertIn('🟡 CPU speed limited to 1596 MHz (hot CPU)', text)
+        self.assertIn('CPU slowed to cool down', text)
+        self.assertNotIn('CPU speed limited', ' '.join(bot.faults({'CPU speed limit MHz': None})))
+        self.assertEqual(bot.temperature_level('CPU', 74.9), bot.YELLOW)
+        self.assertEqual(bot.temperature_level('CPU', 75), bot.RED)
 
     def test_private_atomic_storage(self):
         with tempfile.TemporaryDirectory() as tmp:
