@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only Telegram health monitor; Python standard library only."""
+"""Telegram health monitor with fixed T3 service buttons; Python standard library only."""
 import argparse
 import datetime
 import getpass
@@ -9,13 +9,28 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 CONFIG = Path.home() / '.config/macmini-status-bot/config.json'
 STATE = Path.home() / '.local/state/macmini-status-bot/state.json'
-BUTTON = {'inline_keyboard': [[{'text': 'Status Check', 'callback_data': 'status'}]]}
+BUTTON = {'inline_keyboard': [[{'text': 'Status Check', 'callback_data': 'status'}],
+                              [{'text': 'Refresh providers', 'callback_data': 'refresh'},
+                               {'text': 'Restart T3', 'callback_data': 'restart'}]]}
+BUTTON_DATA = re.compile(r'(status|refresh|restart|cancel|confirm:[0-9a-f]{8})')
+# T3 Code runs as a user service. The provider refresh helper writes its result here.
+T3_UNIT = 't3code.service'
+REFRESH_UNIT = 't3-provider-refresh.service'
+T3_RUNTIME = Path.home() / '.t3/userdata/server-runtime.json'
+T3_STATUS = Path.home() / '.local/state/t3-provider-refresh/status.json'
+STATUS_STALE = 2 * 3600
+STARTUP_GRACE = 15 * 60
+CONFIRM_SECONDS = 60
+ACTION_COOLDOWN = 60
+FOLLOWUP_SECONDS = 30 * 60
 
 
 def atomic_json(path, data):
@@ -40,13 +55,17 @@ def api(token, method, **payload):
 
 
 def authorized(update, cfg):
+    """Return the button's data if the configured user pressed a known button, else None."""
     q = update.get('callback_query', {})
     message = q.get('message', {})
     chat = message.get('chat', {})
-    return (q.get('data') == 'status'
+    data = q.get('data')
+    if (isinstance(data, str) and BUTTON_DATA.fullmatch(data)
             and q.get('from', {}).get('id') == cfg['user_id']
             and chat.get('id') == cfg['chat_id']
-            and chat.get('type') == 'private')
+            and chat.get('type') == 'private'):
+        return data
+    return None
 
 
 def command(args):
@@ -62,6 +81,70 @@ def read_number(path):
         return value if math.isfinite(value) else None
     except (OSError, ValueError):
         return None
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def seconds_since(timestamp):
+    try:
+        then = datetime.datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        return (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def server_answers(origin):
+    # Only the local server; the runtime file must not redirect this request.
+    if not isinstance(origin, str) or not origin.startswith('http://127.0.0.1:'):
+        return False
+    try:
+        with urllib.request.urlopen(origin + '/api/auth/session', timeout=3):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def tunnel_running(cgroup):
+    """T3 starts cloudflared in its own service cgroup for remote access."""
+    if not cgroup.startswith('/'):
+        return None
+    try:
+        pids = Path('/sys/fs/cgroup' + cgroup, 'cgroup.procs').read_text().split()
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            if Path('/proc', pid, 'comm').read_text().strip() == 'cloudflared':
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def t3_sample():
+    props = command(['systemctl', '--user', 'show', T3_UNIT, '-p', 'ActiveState',
+                     '-p', 'ActiveEnterTimestampMonotonic', '-p', 'NRestarts', '-p', 'ControlGroup'])
+    unit = dict(l.split('=', 1) for l in props.splitlines() if '=' in l)
+    state = unit.get('ActiveState') or 'unknown'
+    runtime = read_json(T3_RUNTIME) or {}
+    try:
+        uptime = time.monotonic() - int(unit['ActiveEnterTimestampMonotonic']) / 1e6
+        restarts = int(unit['NRestarts'])
+    except (KeyError, ValueError):
+        uptime, restarts = None, None
+    active = state == 'active'
+    return {'state': state, 'uptime': uptime if active else None, 'restarts': restarts,
+            'version': runtime.get('serverVersion'),
+            'answers': active and server_answers(runtime.get('origin')),
+            'tunnel': tunnel_running(unit.get('ControlGroup', '')) if active else None,
+            'check': read_json(T3_STATUS)}
 
 
 class Sampler:
@@ -140,6 +223,7 @@ class Sampler:
         values['protection'] = ('maximum cooling latched' if 'Fault cooling latched' in status
                                 else 'critical shutdown requested' if 'Critical temperature' in status
                                 else 'temperature curve' if status.startswith('manual;') else 'unknown')
+        values['t3'] = t3_sample()
         values['time'] = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
         return values
 
@@ -173,7 +257,101 @@ def faults(sample):
         result.add('Available RAM below 0.5 GiB')
     if sample.get('Disk used %', 0) >= 95:
         result.add('Disk at least 95% full')
+    if 't3' in sample:
+        result.update(t3_faults(sample['t3']))
     return sorted(result)
+
+
+def t3_faults(t3):
+    # Keep the text stable: a changed fault list sends an alert.
+    result = set()
+    if t3['state'] != 'active':
+        result.add('T3 server ' + t3['state'])
+    elif not t3['answers']:
+        result.add('T3 server not answering')
+    elif t3['tunnel'] is False:
+        result.add('T3 remote tunnel not running')
+    check = t3.get('check')
+    if not check:
+        result.add('T3 provider status unavailable')
+        return result
+    if check.get('error'):
+        result.add('T3 provider check failed')
+    age = seconds_since(check.get('finishedAt'))
+    if age is None or age > STATUS_STALE:
+        result.add('T3 provider status out of date')
+    # The startup refresh normally clears provider warnings from a slow boot.
+    if t3.get('uptime') is None or t3['uptime'] >= STARTUP_GRACE:
+        for provider in check.get('providers', []):
+            if provider.get('status') != 'ready':
+                result.add(f"{provider.get('name')} provider {provider.get('status')}")
+    return result
+
+
+def duration(seconds):
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f'{minutes} min'
+    hours = minutes // 60
+    return f'{hours} h {minutes % 60} min' if hours < 48 else f'{hours // 24} days'
+
+
+def local_time(timestamp):
+    try:
+        then = datetime.datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        return then.astimezone().strftime('%a %H:%M')
+    except (AttributeError, TypeError, ValueError):
+        return 'unknown time'
+
+
+def t3_rows(t3):
+    """Report rows and short notes for the T3 server and its providers."""
+    rows, notes = [], []
+    if t3['state'] == 'active':
+        text = f"Server {t3.get('version') or '(version unknown)'} running"
+        if t3.get('uptime') is not None:
+            text += ' for ' + duration(t3['uptime'])
+        if t3.get('restarts'):
+            text += f", {t3['restarts']} automatic restarts"
+        rows.append((GREEN, text))
+        if not t3['answers']:
+            rows.append((RED, 'Server does not answer local requests'))
+            notes.append('T3 not answering')
+        level, text = {True: (GREEN, 'Remote tunnel running'),
+                       False: (YELLOW, 'Remote tunnel not running')}.get(
+            t3['tunnel'], (YELLOW, 'Remote tunnel: no reading'))
+        rows.append((level, text))
+        if level != GREEN:
+            notes.append('T3 remote access may not work')
+    else:
+        rows.append((RED, 'Server ' + t3['state']))
+        notes.append('T3 server ' + t3['state'])
+    check = t3.get('check')
+    if not check:
+        rows.append((YELLOW, 'Providers: no check result yet'))
+        notes.append('T3 provider status unknown')
+        return rows, notes
+    for provider in check.get('providers', []):
+        status = provider.get('status')
+        text = (f"{provider.get('name')} {provider.get('version') or ''}: {status}, "
+                f"{provider.get('auth')}, {provider.get('models')} models")
+        if provider.get('message'):
+            text += ' — ' + provider['message'][:160]
+        level = GREEN if status == 'ready' else YELLOW if status == 'warning' else RED
+        rows.append((level, text))
+        if level != GREEN:
+            notes.append(f"{provider.get('name')} {status}")
+    when = local_time(check.get('finishedAt'))
+    age = seconds_since(check.get('finishedAt'))
+    if check.get('error'):
+        rows.append((RED, f"Provider check at {when} failed: {check['error'][:200]}"))
+        notes.append('T3 provider check failed')
+    elif age is None or age > STATUS_STALE:
+        rows.append((YELLOW, f'Last provider check {when} is out of date'))
+        notes.append('T3 provider check out of date')
+    else:
+        rows.append(('⚪', f"Providers checked {when} ({check.get('mode')})"))
+    return rows, notes
 
 
 def num(v):
@@ -241,7 +419,11 @@ def report(sample, history=(), title='Status check', cleared=False):
     if level != GREEN:
         notes.append({'maximum cooling latched': 'fan held at max (known SMC flag)'}.get(
             sample['protection'], text.lower()))
-    levels = [lv for lv, _ in rows + load + guard]
+    services = []
+    if 't3' in sample:
+        services, service_notes = t3_rows(sample['t3'])
+        notes += service_notes
+    levels = [lv for lv, _ in rows + load + guard + services]
     overall = RED if RED in levels else YELLOW if YELLOW in levels else GREEN
     verdict = {GREEN: 'All good', YELLOW: 'Watch', RED: 'Needs attention'}[overall]
     def section(heading, items):
@@ -253,6 +435,8 @@ def report(sample, history=(), title='Status check', cleared=False):
     lines += [f'<i>{html.escape(title)} · {html.escape(when)}</i>', '']
     lines += section('🌡 Temperatures', rows) + [''] + section('💻 System', load)
     lines += [''] + section('🛡 Protection', guard)
+    if services:
+        lines += [''] + section('🤖 T3 Code', services)
     if history:
         lines += ['', f'<b>📈 Recent trend</b> ({len(history)} samples, avg / peak)']
         for key, unit in (('CPU', '°C'), ('GPU', '°C'), ('PSU', '°C'), ('CPU usage %', '% busy')):
@@ -264,6 +448,68 @@ def report(sample, history=(), title='Status check', cleared=False):
         lines += ['', '✅ Previously reported alerts have cleared.']
     lines += ['', '<i>Wall power not measured.</i>']
     return '\n'.join(lines)
+
+
+class Controls:
+    """State for the action buttons. They start fixed user units; there is no shell."""
+
+    def __init__(self):
+        self.confirm = None  # (nonce, monotonic expiry) for a pending restart
+        self.last_action = -ACTION_COOLDOWN
+        self.followup = None  # (report title, wall start time, monotonic deadline)
+
+
+def systemctl_user(verb, unit):
+    try:
+        return subprocess.run(['systemctl', '--user', verb, '--no-block', unit],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def press(data, controls):
+    """Handle an action button. Return (toast, message text or None, reply markup)."""
+    now = time.monotonic()
+    if data == 'cancel':
+        controls.confirm = None
+        return 'Cancelled', None, None
+    if now - controls.last_action < ACTION_COOLDOWN:
+        return 'Wait one minute between actions', None, None
+    if data == 'restart':
+        nonce = secrets.token_hex(4)
+        controls.confirm = (nonce, now + CONFIRM_SECONDS)
+        return ('Confirm the restart',
+                '<b>Restart T3 Code?</b>\nRunning agent turns stop. Threads reconnect after '
+                f'the restart. Confirm within {CONFIRM_SECONDS} seconds.',
+                {'inline_keyboard': [[{'text': 'Confirm restart', 'callback_data': 'confirm:' + nonce},
+                                      {'text': 'Cancel', 'callback_data': 'cancel'}]]})
+    if data.startswith('confirm:'):
+        pending, controls.confirm = controls.confirm, None
+        if not pending or pending[0] != data[len('confirm:'):] or now > pending[1]:
+            return 'Confirmation expired. Press Restart T3 again.', None, None
+        verb, unit, name, title = 'restart', T3_UNIT, 'T3 restart', 'After T3 restart'
+    else:
+        verb, unit, name, title = 'start', REFRESH_UNIT, 'Provider refresh', 'After provider refresh'
+    controls.last_action = now
+    if not systemctl_user(verb, unit):
+        return 'Request failed', f'🔴 {name} request failed. Check the user service manager.', BUTTON
+    # Restarting T3 also restarts the refresh unit, so both actions end with a provider check.
+    controls.followup = (title, time.time(), now + FOLLOWUP_SECONDS)
+    return ('Requested', f'⏳ {name} requested. A report follows when the provider check '
+            'finishes. It can take several minutes on this machine.', None)
+
+
+def followup_title(sample, followup):
+    """Return the report title when the requested action has a result, else None."""
+    title, started, deadline = followup
+    check = (sample.get('t3') or {}).get('check') or {}
+    age = seconds_since(check.get('finishedAt'))
+    if age is not None and time.time() - age >= started - 1:
+        return title
+    if time.monotonic() > deadline:
+        return title + ' (provider check did not finish in 30 min)'
+    return None
 
 
 def load_config():
@@ -287,6 +533,7 @@ def run():
     except (OSError, ValueError):
         state = {}
     sampler = Sampler()
+    controls = Controls()
     history = []
     next_sample = 0
     last_button = -100
@@ -313,10 +560,16 @@ def run():
                     if due:
                         state['sent'] = time.time()
                     atomic_json(STATE, state)
+                title = controls.followup and followup_title(sample, controls.followup)
+                if title:
+                    controls.followup = None
+                    api(cfg['token'], 'sendMessage', chat_id=cfg['chat_id'],
+                        text=report(sample, title=title), parse_mode='HTML', reply_markup=BUTTON)
             updates = api(cfg['token'], 'getUpdates', offset=offset, timeout=20,
                           allowed_updates=['callback_query'], limit=10)
             for update in updates:
-                if authorized(update, cfg):
+                data = authorized(update, cfg)
+                if data == 'status':
                     q = update['callback_query']
                     api(cfg['token'], 'answerCallbackQuery', callback_query_id=q['id'])
                     if time.monotonic() - last_button >= 10:
@@ -324,6 +577,18 @@ def run():
                             text=report(sampler.sample()),
                             parse_mode='HTML', reply_markup=BUTTON)
                         last_button = time.monotonic()
+                elif data:
+                    q = update['callback_query']
+                    toast, text, markup = press(data, controls)
+                    api(cfg['token'], 'answerCallbackQuery', callback_query_id=q['id'], text=toast)
+                    if data == 'cancel' or data.startswith('confirm:'):
+                        # Remove the confirmation buttons, so they cannot be pressed again.
+                        api(cfg['token'], 'editMessageReplyMarkup', chat_id=cfg['chat_id'],
+                            message_id=q['message'].get('message_id'),
+                            reply_markup={'inline_keyboard': []})
+                    if text:
+                        api(cfg['token'], 'sendMessage', chat_id=cfg['chat_id'], text=text,
+                            parse_mode='HTML', **({'reply_markup': markup} if markup else {}))
                 offset = max(offset, update['update_id'] + 1)
                 state['offset'] = offset
                 atomic_json(STATE, state)

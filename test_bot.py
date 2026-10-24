@@ -90,6 +90,120 @@ class Tests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '^Telegram request failed$'):
                 bot.api('synthetic:credential', 'getUpdates')
 
+
+def t3(**changes):
+    check = {'mode': 'check', 'error': None,
+             'finishedAt': bot.datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
+             'providers': [{'name': 'Claude', 'version': '2.1.308', 'status': 'ready',
+                            'auth': 'authenticated', 'models': 13, 'message': None}]}
+    value = {'state': 'active', 'uptime': 3600, 'restarts': 0, 'version': '0.1.1',
+             'answers': True, 'tunnel': True, 'check': check}
+    value.update(changes)
+    return value
+
+
+class T3Tests(unittest.TestCase):
+    def test_healthy_t3_section(self):
+        text = bot.report({'time': 'now', 'controller': 'active',
+                           'protection': 'temperature curve', 't3': t3()})
+        self.assertIn('🤖 T3 Code', text)
+        self.assertIn('🟢 Server 0.1.1 running for 1 h 0 min', text)
+        self.assertIn('🟢 Claude 2.1.308: ready, authenticated, 13 models', text)
+        self.assertEqual(bot.t3_faults(t3()), set())
+
+    def test_server_and_tunnel_faults(self):
+        self.assertIn('T3 server failed', bot.t3_faults(t3(state='failed')))
+        self.assertIn('T3 server not answering', bot.t3_faults(t3(answers=False)))
+        self.assertIn('T3 remote tunnel not running', bot.t3_faults(t3(tunnel=False)))
+        text = bot.report({'time': 'now', 'controller': 'active',
+                           'protection': 'temperature curve', 't3': t3(state='failed')})
+        self.assertIn('🔴 Server failed', text)
+        self.assertIn('Needs attention', text)
+
+    def test_provider_warning_waits_for_startup_refresh(self):
+        check = t3()['check']
+        check['providers'][0].update(status='warning', message='Timed out <25s>')
+        self.assertEqual(bot.t3_faults(t3(uptime=120, check=check)), set())
+        self.assertIn('Claude provider warning', bot.t3_faults(t3(uptime=3600, check=check)))
+        text = bot.report({'time': 'now', 'controller': 'active',
+                           'protection': 'temperature curve', 't3': t3(check=check)})
+        self.assertIn('🟡 Claude 2.1.308: warning', text)
+        self.assertIn('Timed out &lt;25s&gt;', text)
+
+    def test_failed_stale_and_missing_checks(self):
+        check = dict(t3()['check'], error='RuntimeError: WebSocket upgrade rejected')
+        self.assertIn('T3 provider check failed', bot.t3_faults(t3(check=check)))
+        self.assertIn('WebSocket upgrade rejected', bot.report(
+            {'time': 'now', 'controller': 'active', 'protection': 'temperature curve',
+             't3': t3(check=check)}))
+        stale = dict(t3()['check'], finishedAt='2026-01-01T00:00:00+07:00')
+        self.assertIn('T3 provider status out of date', bot.t3_faults(t3(check=stale)))
+        self.assertIn('T3 provider status unavailable', bot.t3_faults(t3(check=None)))
+
+    def test_buttons_are_allowlisted(self):
+        for data in ('status', 'refresh', 'restart', 'cancel', 'confirm:0123abcd'):
+            update = {'callback_query': {'data': data, 'from': {'id': 1},
+                                         'message': {'chat': {'id': 1, 'type': 'private'}}}}
+            self.assertEqual(bot.authorized(update, {'user_id': 1, 'chat_id': 1}), data)
+        for data in ('confirm:zz', 'restart now', 'systemctl', None):
+            update = {'callback_query': {'data': data, 'from': {'id': 1},
+                                         'message': {'chat': {'id': 1, 'type': 'private'}}}}
+            self.assertIsNone(bot.authorized(update, {'user_id': 1, 'chat_id': 1}))
+
+
+class ControlTests(unittest.TestCase):
+    def test_restart_needs_matching_confirmation(self):
+        controls = bot.Controls()
+        with patch('bot.systemctl_user', return_value=True) as systemctl:
+            toast, text, markup = bot.press('restart', controls)
+            self.assertIn('Restart T3 Code?', text)
+            nonce = markup['inline_keyboard'][0][0]['callback_data']
+            self.assertIn('expired', bot.press('confirm:00000000', controls)[0])
+            systemctl.assert_not_called()
+            bot.press('restart', controls)
+            nonce = controls.confirm[0]
+            toast, text, _ = bot.press('confirm:' + nonce, controls)
+            # A used confirmation cannot restart again, even after the cooldown.
+            controls.last_action = -bot.ACTION_COOLDOWN
+            self.assertIn('expired', bot.press('confirm:' + nonce, controls)[0])
+        systemctl.assert_called_once_with('restart', 't3code.service')
+        self.assertEqual(toast, 'Requested')
+        self.assertEqual(controls.followup[0], 'After T3 restart')
+
+    def test_confirmation_expires(self):
+        controls = bot.Controls()
+        with patch('bot.systemctl_user', return_value=True) as systemctl:
+            bot.press('restart', controls)
+            nonce, _ = controls.confirm
+            controls.confirm = (nonce, bot.time.monotonic() - 1)
+            self.assertIn('expired', bot.press('confirm:' + nonce, controls)[0])
+        systemctl.assert_not_called()
+
+    def test_refresh_starts_unit_and_cooldown_applies(self):
+        controls = bot.Controls()
+        with patch('bot.systemctl_user', return_value=True) as systemctl:
+            self.assertEqual(bot.press('refresh', controls)[0], 'Requested')
+            self.assertIn('Wait', bot.press('refresh', controls)[0])
+            self.assertIn('Wait', bot.press('restart', controls)[0])
+        systemctl.assert_called_once_with('start', 't3-provider-refresh.service')
+
+    def test_failed_request_is_reported(self):
+        with patch('bot.systemctl_user', return_value=False):
+            toast, text, markup = bot.press('refresh', bot.Controls())
+        self.assertEqual(toast, 'Request failed')
+        self.assertIn('🔴', text)
+        self.assertIsNone(bot.Controls().followup)
+
+    def test_followup_waits_for_new_check(self):
+        started = bot.time.time()
+        followup = ('After provider refresh', started, bot.time.monotonic() + 60)
+        old = t3(check=dict(t3()['check'], finishedAt='2026-01-01T00:00:00+07:00'))
+        self.assertIsNone(bot.followup_title({'t3': old}, followup))
+        self.assertEqual(bot.followup_title({'t3': t3()}, followup), 'After provider refresh')
+        late = ('After provider refresh', started, bot.time.monotonic() - 1)
+        self.assertIn('did not finish', bot.followup_title({'t3': old}, late))
+
+
 class LoopTests(unittest.TestCase):
     def test_only_allowed_callback_produces_report_and_offset_survives(self):
         cfg = {'token':'synthetic:credential', 'user_id':123, 'chat_id':123}
@@ -128,5 +242,30 @@ class LoopTests(unittest.TestCase):
                  patch('builtins.print'):
                 with self.assertRaises(KeyboardInterrupt):bot.run()
             self.assertFalse(state.exists())
+
+    def test_action_buttons_answer_and_clear_confirmation(self):
+        cfg = {'token':'synthetic:credential', 'user_id':123, 'chat_id':123}
+        sample = {'time':'now', 'controller':'active', 'protection':'temperature curve'}
+        chat = {'chat':{'id':123, 'type':'private'}, 'message_id':7}
+        calls=[]
+        def api(token, method, **kwargs):
+            calls.append((method,kwargs))
+            if method=='getWebhookInfo':return {}
+            if method=='getUpdates':
+                if sum(m=='getUpdates' for m,k in calls)>1:raise KeyboardInterrupt()
+                return [{'update_id':1,'callback_query':{'id':'a','data':'refresh','from':{'id':123},'message':chat}},
+                        {'update_id':2,'callback_query':{'id':'b','data':'cancel','from':{'id':123},'message':chat}}]
+            return {}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('bot.STATE',Path(tmp)/'state.json'), patch('bot.load_config',return_value=cfg), \
+                 patch('bot.Sampler.sample',return_value=sample), patch('bot.api',side_effect=api), \
+                 patch('bot.systemctl_user',return_value=True) as systemctl:
+                with self.assertRaises(KeyboardInterrupt):bot.run()
+        systemctl.assert_called_once_with('start','t3-provider-refresh.service')
+        answers=[k['text'] for m,k in calls if m=='answerCallbackQuery']
+        self.assertEqual(answers,['Requested','Cancelled'])
+        edits=[k for m,k in calls if m=='editMessageReplyMarkup']
+        self.assertEqual(edits,[{'chat_id':123,'message_id':7,'reply_markup':{'inline_keyboard':[]}}])
+        self.assertTrue(any('Provider refresh requested' in k.get('text','') for m,k in calls if m=='sendMessage'))
 
 if __name__ == '__main__': unittest.main()

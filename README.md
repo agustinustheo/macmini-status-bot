@@ -1,7 +1,8 @@
 # MacMini Status Bot
 
-Check a Linux Mac mini from Telegram with one **Status Check** button. Receive
-hourly health summaries and alerts when monitored conditions change.
+Check a Linux Mac mini from Telegram with a **Status Check** button. Receive
+hourly health summaries and alerts when monitored conditions change. Check the
+T3 Code server and its Claude and Codex providers, and refresh or restart them.
 
 Built for an older machine: Python's standard library, Linux sensor files, and
 Telegram long polling. No AI runtime, database, web server, or pip dependencies.
@@ -20,15 +21,26 @@ and shutdown.
 | Memory | Available RAM and occupied swap |
 | Thermal controller | Service state and interpreted cooling mode |
 | Power consumption | Explicitly unavailable until supported metering is implemented |
+| T3 Code | Server state, version, uptime, local answer, remote tunnel, and each provider's version, status, and last message |
 
 **Watts and kWh are not estimated from CPU usage or PSU temperature.** The current
 implementation has no wall-power meter integration. The physical locations of
 `TN1F` and `TN1S` are uncertain, so reports do not invent component mappings.
 
-Each message includes an inline **Status Check** button. Only the configured
-Telegram user in the configured private chat can request a report. Typed messages,
-including `/status`, are ignored. Telegram still displays its text input box.
-There are no remote shell, Codex, fan-control, restart, or shutdown commands.
+Each message includes inline buttons. Only the configured Telegram user in the
+configured private chat can use them. Typed messages, including `/status`, are
+ignored. Telegram still displays its text input box.
+
+| Button | Action |
+| --- | --- |
+| **Status Check** | Sends a new report |
+| **Refresh providers** | Starts `t3-provider-refresh.service`, which checks each provider again |
+| **Restart T3** | Asks for confirmation, then restarts `t3code.service`. Confirm within 60 seconds |
+
+After an action, the bot sends a report when the next provider check finishes, or
+after 30 minutes. Allow one minute between actions. A restart stops running agent
+turns. The buttons start only these two fixed user units. There are no remote
+shell, new-thread, fan-control, or host shutdown and reboot commands.
 
 ## Requirements
 
@@ -37,6 +49,9 @@ There are no remote shell, Codex, fan-control, restart, or shutdown commands.
   This implementation targets `applesmc`, `coretemp`, and `nouveau`.
 - The companion `macmini-thermal-guard.service` for controller status. A missing
   service is reported as inactive or unreadable.
+- Optional: T3 Code as the `t3code.service` user service, and the provider
+  refresh helper that writes `~/.local/state/t3-provider-refresh/status.json`.
+  Without them, reports show the T3 section as failed or unknown.
 - Outbound HTTPS access to Telegram; no inbound port or public URL is required.
 - A dedicated Telegram bot token and your numeric user/private-chat IDs.
 
@@ -169,6 +184,12 @@ Warnings currently trigger at:
 | Root filesystem | At least 95% used |
 | Required temperature or fan reading | Missing or unreadable |
 | Thermal controller | Inactive, unreadable, or outside the recognized normal temperature-curve mode |
+| T3 server | Not active, does not answer local requests, or remote tunnel not running |
+| T3 provider | Not `ready` 15 minutes or more after the T3 start |
+| T3 provider check | Failed, missing, or older than two hours |
+
+The 15-minute wait gives the startup refresh time to clear a slow boot check.
+The report still shows the provider status during that time.
 
 These temperature levels are early warnings relative to the companion controller's
 configuration, **not manufacturer damage limits**. They are fixed in `bot.py` and
@@ -229,7 +250,9 @@ systemctl --user show macmini-status-bot.service \
 | Enabled but inactive | Run setup; verify the config exists, then start the service |
 | No first message | Press Start in the bot's private chat; verify token and both IDs |
 | Button does nothing | Use the authorized account and private chat; allow the ten-second cooldown |
-| Typed commands do nothing | Expected: only the inline button is implemented |
+| Typed commands do nothing | Expected: only the inline buttons are implemented |
+| T3 provider check failed | Read the error in the report, then `journalctl --user -u t3-provider-refresh.service -n 30` |
+| T3 provider status out of date | `systemctl --user list-timers t3-provider-check.timer` |
 | Startup failure | Config permissions/values, outbound HTTPS, or an existing webhook |
 | Repeated generic retry messages | Connectivity, token validity, chat access, or another polling client |
 | Missing temperatures | Check thermal drivers and compare with `python3 bot.py status` |
